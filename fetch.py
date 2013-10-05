@@ -13,17 +13,12 @@ def first(li):
     except IndexError:
         return None
 
-def timestamper():
-    return int(time.time())
-
 def fetch_nominees_info(s, ids):
     for id_ in ids:
         ri      = s.get('http://valberedning.sverok.se/admin/nominees/edit/{}'.format(id_))
         soup    = BeautifulSoup(ri.text)
         nominee = {
                     'image'     : first([x.find('img')['src'] for x in soup.find_all('div', 'nominee-image')]),
-                    'id'        : int(id_), 
-                    'timestamp' : timestamper()
                   }
 
         for label in soup.find_all('label'):
@@ -44,7 +39,7 @@ def fetch_nominees_info(s, ids):
             if all((lbltxt, val)):
                 nominee[lbltxt] = val
 
-        yield nominee
+        yield (int(id_), nominee)
 
 def fetch_questionnaires_info(s, ids):
     for id_ in ids:
@@ -103,26 +98,29 @@ def fetch_questionnaires_info(s, ids):
                 else:
                     acc['val'].append(x['val'])
 
+            del acc['id']
             questionnaire[k] = acc
 
-        questionnaire['id'] = int(id_)
-        yield questionnaire
+        yield (int(id_), questionnaire)
 
 def main():
-    db = MongoClient('localhost', 27017).db
+    db = MongoClient('localhost', 27017).argyrodes
 
     s   = requests.Session()
-    r1  = s.post('http://valberedning.sverok.se/users/login', data={'data[User][username]' : conf.username, 'data[User][password]' : conf.password})
+    r1  = s.post('http://valberedning.sverok.se/users/login', data={'data[User][username]' : conf.USERNAME, 'data[User][password]' : conf.PASSWORD})
     r2  = s.get('http://valberedning.sverok.se/admin/nominees')
     ids = filter(bool, [t.get('data-id', '') for t in BeautifulSoup(r2.text).find_all('div', 'nominee-list-item')])
+    ts  = int(time.time()) # Timestamp
 
-    for n in fetch_nominees_info(s, ids):
+    for uid, n in fetch_nominees_info(s, ids):
+        n['timestamp'] = ts
         print n
-        db.nominees.insert(n)
+        db.nominees.update({'uid' : uid}, {'$push' : {'nominee' : n}}, upsert=True)
 
-    for q in fetch_questionnaires_info(s, ids):
+    for uid, q in fetch_questionnaires_info(s, ids):
+        q['timestamp'] = ts
         print q
-        db.questionnaire.insert(q)
+        db.nominees.update({'uid' : uid}, {'$push' : {'questionnaire' : q}}, upsert=True)
 
 if __name__ == '__main__':
     main()
