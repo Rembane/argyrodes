@@ -2,10 +2,25 @@
 
 from bs4 import BeautifulSoup
 from collections import defaultdict
-from pymongo import MongoClient
-import conf, re, requests, time
+import conf, re, requests, subprocess, time
 
-digipattern = re.compile(r'\d+')
+template = \
+u"""{images}
+[b]Namn:[/b] {name}
+{info}
+[b]Accepterar kandidatur som:[/b] {accepted_nominations}
+
+[b]Presentation:[/b]
+{presentation}
+
+{questionnaire}
+
+URL till kandidaten på valberedning.sverok.se: [url={url}]{url}[/url]
+"""
+
+image_template = u"[img]http://valberedning.sverok.se{}[/img]"
+info_template  = u"[b]{}[/b] {}"
+q_template     = u"[b]{}[/b]\n{}"
 
 def first(li):
     try:
@@ -13,114 +28,83 @@ def first(li):
     except IndexError:
         return None
 
-def fetch_nominees_info(s, ids):
+def pairify(xs):
+    it = iter(xs)
+    while True:
+        yield (it.next(), it.next())
+
+def fetch_nominees_info(ids):
     for id_ in ids:
-        ri      = s.get('http://valberedning.sverok.se/admin/nominees/edit/{}'.format(id_))
+        ri      = requests.get('http://valberedning.sverok.se/nominees/view/{}'.format(id_))
         soup    = BeautifulSoup(ri.text)
+        info    = soup.find('div', 'info')
         nominee = {
-                    'image'     : first([x.find('img')['src'] for x in soup.find_all('div', 'nominee-image')]),
+                    'images'               : [x['src'].strip() for x in getattr(soup.find('div', id='galleri'), 'find_all', lambda x: [])('img')],
+                    'name'                 : info.h2.text.strip(),
+                    'info'                 : list(pairify(x.text.strip() for x in info.find_all(['label', 'span'], recursive=False))),
+                    'accepted_nominations' : [(x.text.split(':')[0].strip(), bool(x.find(text=re.compile(r'Valberedningens ')))) for x in info.find('ul', 'nominations').find_all('li') if x.find_all('span', text=re.compile(r'(Accepterat)|(Valberedningens )'))],
+                    'presentation'         : soup.find('div', 'presentation').text.strip(),
+                    'url'                  : 'http://valberedning.sverok.se/nominees/view/{}'.format(id_)
                   }
 
-        for label in soup.find_all('label'):
-            lbltxt  = unicode(getattr(label, 'string', u''))
-            element = label.find_next_sibling(attrs={'id' : label['for']}) or label.find_previous_sibling(attrs={'id' : label['for']})
-            elname  = element.name
-            val     = ''
+        if not nominee['accepted_nominations']:
+            # Skip people who haven't accepted anything
+            continue
 
-            if elname == 'input' and element['type'] == 'text':
-                val = element.get('value', '')
-            elif elname == 'textarea':
-                val = unicode(getattr(element, 'string', u''))
-            elif elname == 'select':
-                val = unicode(getattr(element.find('option', selected='selected'), 'string', u''))
-            else:
-                continue
+        form                = soup.find('form')
+        nominee['qanswers'] = []
+        if form:
+            result = []
+            for t in form:
+                if t.name == 'span' and t.text:
+                    if u'Här kommer tre korta' not in t.text:
+                        result.append(t.text.strip())
+                elif t.name == 'div':
+                    if 'textarea' in t.get('class', ''):
+                        result.append(t.text.strip())
+                    elif 'limit-wrapper' in t.get('class', ''):
+                        result.append(', '.join(sorted([x.text for x in t.find_all('label', 'selected')])))
+                    elif 'radio' in t.get('class', ''):                    
+                        result.append(t.previous_sibling.text.strip())
+                        result.append(t.find('input', checked='checked').next_sibling.text.strip())
 
-            if all((lbltxt, val)):
-                nominee[lbltxt] = val
+            nominee['qanswers'] = list(pairify(result))
 
-        yield (int(id_), nominee)
-
-def fetch_questionnaires_info(s, ids):
-    for id_ in ids:
-        # Map
-        ri            = s.get('http://valberedning.sverok.se/admin/questionnaires/edit/{}'.format(id_))
-        soup          = BeautifulSoup(ri.text)
-        questionnaire = defaultdict(list)
-
-        for t in soup.find_all(['textarea', 'input']):
-            if t.name == 'input' and t['type'] not in ['checkbox', 'radio']:
-                continue
-
-            if 'visible' in t['name']:
-                continue
-
-            curr = {'id' : digipattern.search(t['name']).group()}
-
-            for t1 in t.previous_elements:
-                if t1.name == 'h3':
-                    curr['header'] = t1.text
-                    break
-
-            if t.name == 'textarea':
-                curr['val'] = u''.join(t.stripped_strings)
-
-            if t.name == 'input':
-                if t['type'] in ['checkbox', 'radio']:
-                    # I suppose we got a couple of distinct cases:
-                    foundit = False
-                    for x in t.children:
-                        if x.name == 'label':
-                            curr['val'] = x.text
-                            foundit = True
-                            break
-
-                    if not foundit:
-                        curr['val'] = t.next_sibling.text
-
-                    curr['checked'] = bool(t.get('checked', False))
-
-            questionnaire[curr['id']].append(curr)
-
-        # Reduce
-        for (k,v) in questionnaire.iteritems():
-            acc = v[0]
-
-            if 'checked' in acc:
-                acc['val'] = [(acc['val'], acc['checked'])]
-                del acc['checked']
-            else:
-                acc['val'] = [acc['val']]
-
-            for x in v[1:]:
-                if 'checked' in x:
-                    acc['val'].append((x['val'], x['checked']))
-                else:
-                    acc['val'].append(x['val'])
-
-            del acc['id']
-            questionnaire[k] = acc
-
-        yield (int(id_), questionnaire)
+        yield nominee
 
 def main():
-    db = MongoClient('localhost', 27017).argyrodes
+    abbrs = { u'Förbundsordförande'          : u'O',
+              u'Vice Förbundsordförande'     : u'VO', 
+              u'Förbundssekreterare'         : u'S',
+              u'Ledamot i förbundsstyrelsen' : u'L',
+              u'Revisor'                     : u'R',
+              u'Valberedare'                 : u'VB',
+              True                           : u'*',
+              False                          : u''
+            }
 
-    s   = requests.Session()
-    r1  = s.post('http://valberedning.sverok.se/users/login', data={'data[User][username]' : conf.USERNAME, 'data[User][password]' : conf.PASSWORD})
-    r2  = s.get('http://valberedning.sverok.se/admin/nominees')
-    ids = filter(bool, [t.get('data-id', '') for t in BeautifulSoup(r2.text).find_all('div', 'nominee-list-item')])
-    ts  = int(time.time()) # Timestamp
+    short_order = dict(zip(['O', 'VO', 'S', 'L', 'VB', 'R'], range(6)))
+    def short_sort(li):
+        return zip(*sorted([(short_order[x.replace('*', '')], x) for x in li]))[1]
 
-    for uid, n in fetch_nominees_info(s, ids):
-        n['timestamp'] = ts
-        print n
-        db.nominees.update({'uid' : uid}, {'$push' : {'nominee' : n}}, upsert=True)
+    ids = filter(bool, [t.get('data-id', '') for t in BeautifulSoup(requests.get('http://valberedning.sverok.se').text).find_all('div', 'nominee-list-item') if 'turned-down' not in t['class']])
 
-    for uid, q in fetch_questionnaires_info(s, ids):
-        q['timestamp'] = ts
-        print q
-        db.nominees.update({'uid' : uid}, {'$push' : {'questionnaire' : q}}, upsert=True)
+    for n in fetch_nominees_info(ids):
+        shorts                    = ['{}{}'.format(abbrs[x], abbrs[y]) for x,y in n['accepted_nominations']]
+        n['accepted_nominations'] = u', '.join(sorted(zip(*n['accepted_nominations'])[0]))
+        n['images']               = u' '.join(map(image_template.format, n['images']))
+        n['info']                 = u'\n'.join([info_template.format(*x) for x in sorted(n['info'])])
+        n['questionnaire']        = u'\n\n'.join([q_template.format(*x) for x in n['qanswers']])
+        s = template.format(**n)
+
+        print n['name']
+        for x in [u'{} [{}]'.format(n['name'], u','.join(short_sort(shorts))), s]:
+            # Copy data to all clipboards
+            for args in ('-pi', '-bi'):
+                p = subprocess.Popen(['xsel', args], stdin=subprocess.PIPE)
+                p.communicate(x.encode('utf-8'))
+
+            raw_input('In buffer!')
 
 if __name__ == '__main__':
     main()
